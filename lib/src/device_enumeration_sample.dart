@@ -7,23 +7,10 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-class SignalingService {
-  final WebSocketChannel _channel;
-  final Function(dynamic) onMessage;
+import '../signaling_service.dart';
 
-  SignalingService(String url, {required this.onMessage})
-    : _channel = WebSocketChannel.connect(Uri.parse(url)) {
-    _channel.stream.listen(onMessage);
-  }
-
-  void send(dynamic message) {
-    _channel.sink.add(jsonEncode(message));
-  }
-
-  void dispose() {
-    _channel.sink.close();
-  }
-}
+// Use a constant for the signaling server URL
+const String signalingServerUrl = 'ws://192.168.56.1:8080';
 
 class VideoSize {
   VideoSize(this.width, this.height);
@@ -86,13 +73,13 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
 
   late SignalingService _signaling;
   var _speakerphoneOn = false;
-  var _isOffer = false;
+  var _isOffer = false; // Track if this peer initiated the offer.
 
   @override
   void initState() {
     super.initState();
     _signaling = SignalingService(
-      'ws://192.168.56.1:8080',
+      signalingServerUrl, // Use the constant
       onMessage: _handleSignalingMessage,
     );
     initRenderers();
@@ -141,6 +128,13 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
 
     _peerConnection = await createPeerConnection(configuration);
 
+    _peerConnection?.onTrack = (RTCTrackEvent event) {
+      if (event.streams.isNotEmpty) {
+        _remoteRenderer.srcObject = event.streams[0];
+      }
+      setState(() {});
+    };
+
     _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate != null) {
         _signaling.send({
@@ -157,13 +151,6 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
     _peerConnection?.onIceConnectionState = (RTCIceConnectionState state) {
       print('ICE connection state changed: $state');
     };
-
-    _peerConnection?.onTrack = (RTCTrackEvent event) {
-      if (event.track.kind == 'video') {
-        _remoteRenderer.srcObject = event.streams[0];
-      }
-      setState(() {});
-    };
   }
 
   void _handleSignalingMessage(dynamic message) async {
@@ -171,6 +158,7 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
     switch (data['type']) {
       case 'offer':
         if (!_isOffer) {
+          print('Received offer...');
           await _peerConnection?.setRemoteDescription(
             RTCSessionDescription(data['sdp'], data['type']),
           );
@@ -181,6 +169,7 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
         break;
 
       case 'answer':
+        print('Received answer...');
         await _peerConnection?.setRemoteDescription(
           RTCSessionDescription(data['sdp'], data['type']),
         );
@@ -194,6 +183,9 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
         );
         await _peerConnection?.addCandidate(candidate);
         break;
+      case 'error': //handle errors
+        print('Signaling Error: ${data['message']}');
+        break;
     }
   }
 
@@ -206,7 +198,7 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
       }
 
       final mediaConstraints = {
-        'audio': true,
+        'audio': true, // Keep audio enabled for proper feedback handling
         'video':
             _isVideoEnabled
                 ? {
@@ -218,7 +210,7 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
                     ],
                   'width': _selectedVideoSize.width,
                   'height': _selectedVideoSize.height,
-                  'frameRate': _selectedVideoFPS,
+                  'frameRate': int.parse(_selectedVideoFPS!),
                 }
                 : false,
       };
@@ -230,18 +222,19 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
 
       await _createPeerConnection();
 
-      // Properly handle track addition with null checks
+      // Attach tracks.  Important to do this *after* creating the PC.
       if (_localStream != null && _peerConnection != null) {
         for (final track in _localStream!.getTracks()) {
           final sender = await _peerConnection!.addTrack(track, _localStream!);
           senders.add(sender);
         }
-      }
 
-      if (_isOffer) {
-        final offer = await _peerConnection?.createOffer();
-        await _peerConnection?.setLocalDescription(offer!);
-        _signaling.send({'type': 'offer', 'sdp': offer?.sdp});
+        // Initiate the offer if this side starts.
+        print('Creating offer...');
+        final offer = await _peerConnection!.createOffer();
+        await _peerConnection!.setLocalDescription(offer);
+        _signaling.send({'type': 'offer', 'sdp': offer.sdp});
+        _isOffer = true;
       }
 
       setState(() {
@@ -249,46 +242,290 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
       });
     } catch (e) {
       print('Error starting call: $e');
+      // Show error to user.
+      _showErrorDialog('Failed to start call: $e');
     }
+  }
+
+  void _showErrorDialog(String message) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Error'),
+          content: Text(message),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Future<void> _stop() async {
     try {
+      // Dispose of the stream and renderers.
       await _localStream?.dispose();
       _localStream = null;
       _localRenderer.srcObject = null;
       _remoteRenderer.srcObject = null;
 
+      // Close the peer connection.
       await _peerConnection?.close();
       _peerConnection = null;
+      senders.clear(); // Clear senders
 
       setState(() {
         _inCalling = false;
         _speakerphoneOn = false;
+        _isOffer = false;
       });
     } catch (e) {
       print('Error stopping call: $e');
+      _showErrorDialog('Failed to stop call: $e');
     }
   }
 
-  // ... (keep all other methods like _toggleVideoMode, _selectVideoInput, etc. the same)
+  Future<void> _toggleVideoMode() async {
+    _isVideoEnabled = !_isVideoEnabled;
+
+    if (_inCalling) {
+      if (_isVideoEnabled) {
+        await _selectVideoInput(_selectedVideoInputId);
+      } else {
+        //stop video track.
+        _localStream?.getVideoTracks().forEach((track) async {
+          await track.stop();
+        });
+        _localRenderer.srcObject = null;
+      }
+    }
+    setState(() {});
+  }
+
+  Future<void> _selectVideoInput(String? deviceId) async {
+    _selectedVideoInputId = deviceId;
+    if (!_inCalling || !_isVideoEnabled) return;
+
+    _localRenderer.srcObject = null;
+
+    //stop the existing tracks.
+    _localStream?.getTracks().forEach((track) async {
+      await track.stop();
+    });
+    await _localStream?.dispose();
+
+    var newLocalStream = await navigator.mediaDevices.getUserMedia({
+      'audio': true, // Keep audio
+      'video': {
+        if (_selectedVideoInputId != null && kIsWeb)
+          'deviceId': _selectedVideoInputId,
+        if (_selectedVideoInputId != null && !kIsWeb)
+          'optional': [
+            {'sourceId': _selectedVideoInputId},
+          ],
+        'width': _selectedVideoSize.width,
+        'height': _selectedVideoSize.height,
+        'frameRate': int.parse(_selectedVideoFPS!),
+      },
+    });
+
+    _localStream = newLocalStream;
+    _localRenderer.srcObject = _localStream;
+
+    // Replace the video track.
+    var newTrack = _localStream?.getVideoTracks().first;
+    var sender = senders.firstWhereOrNull(
+      (sender) => sender.track?.kind == 'video',
+    );
+
+    if (sender != null) {
+      var params = sender.parameters;
+      params.degradationPreference =
+          RTCDegradationPreference.MAINTAIN_RESOLUTION;
+      await sender.setParameters(params);
+      await sender.replaceTrack(newTrack);
+    }
+    setState(() {});
+  }
+
+  Future<void> _selectAudioInput(String? deviceId) async {
+    _selectedAudioInputId = deviceId;
+    if (!_inCalling) return;
+
+    var newLocalStream = await navigator.mediaDevices.getUserMedia({
+      'audio': {
+        if (_selectedAudioInputId != null && kIsWeb)
+          'deviceId': _selectedAudioInputId,
+        if (_selectedAudioInputId != null && !kIsWeb)
+          'optional': [
+            {'sourceId': _selectedAudioInputId},
+          ],
+      },
+      'video':
+          _isVideoEnabled
+              ? {
+                'width': _selectedVideoSize.width,
+                'height': _selectedVideoSize.height,
+                'frameRate': int.parse(_selectedVideoFPS!),
+              }
+              : false,
+    });
+
+    // Replace the audio track.
+    var newTrack = newLocalStream.getAudioTracks().first;
+    var sender = senders.firstWhereOrNull(
+      (sender) => sender.track?.kind == 'audio',
+    );
+    if (sender != null) {
+      await sender.replaceTrack(newTrack);
+    }
+    //dispose old stream
+    _localStream?.getAudioTracks().forEach((track) {
+      track.stop();
+    });
+    await _localStream?.dispose();
+    _localStream = newLocalStream;
+  }
+
+  Future<void> _selectAudioOutput(String? deviceId) async {
+    if (!_inCalling) return;
+    await _localRenderer.audioOutput(deviceId!);
+  }
+
+  Future<void> _setSpeakerphoneOn() async {
+    _speakerphoneOn = !_speakerphoneOn;
+    await Helper.setSpeakerphoneOn(_speakerphoneOn);
+    setState(() {});
+  }
+
+  Future<void> _selectVideoFps(String fps) async {
+    _selectedVideoFPS = fps;
+    if (!_inCalling) return;
+    await _selectVideoInput(_selectedVideoInputId);
+  }
+
+  Future<void> _selectVideoSize(String size) async {
+    _selectedVideoSize = VideoSize.fromString(size);
+    if (!_inCalling) return;
+    await _selectVideoInput(_selectedVideoInputId);
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('WebRTC Call'),
+        title: const Text('Call Screen'),
         actions: [
-          IconButton(
-            icon: Icon(_isOffer ? Icons.call : Icons.call_received),
-            onPressed: () {
-              setState(() {
-                _isOffer = !_isOffer;
-              });
+          PopupMenuButton<String>(
+            onSelected: _selectAudioInput,
+            icon: const Icon(Icons.settings_voice),
+            itemBuilder: (BuildContext context) {
+              return audioInputs
+                  .map(
+                    (device) => PopupMenuItem<String>(
+                      value: device.deviceId,
+                      child: Text(device.label),
+                    ),
+                  )
+                  .toList();
             },
-            tooltip: _isOffer ? 'Switch to Answer' : 'Switch to Offer',
           ),
-          // ... (keep all other action buttons the same)
+          if (!WebRTC.platformIsMobile)
+            PopupMenuButton<String>(
+              onSelected: _selectAudioOutput,
+              icon: const Icon(Icons.volume_down_alt),
+              itemBuilder: (BuildContext context) {
+                return audioOutputs
+                    .map(
+                      (device) => PopupMenuItem<String>(
+                        value: device.deviceId,
+                        child: Text(device.label),
+                      ),
+                    )
+                    .toList();
+              },
+            ),
+          if (!kIsWeb && WebRTC.platformIsMobile)
+            IconButton(
+              onPressed: _setSpeakerphoneOn,
+              icon: Icon(
+                _speakerphoneOn ? Icons.speaker_phone : Icons.phone_android,
+              ),
+              tooltip: 'Switch SpeakerPhone',
+            ),
+          PopupMenuButton<String>(
+            onSelected: _selectVideoInput,
+            icon: const Icon(Icons.switch_camera),
+            itemBuilder: (BuildContext context) {
+              return videoInputs
+                  .map(
+                    (device) => PopupMenuItem<String>(
+                      value: device.deviceId,
+                      child: Text(device.label),
+                    ),
+                  )
+                  .toList();
+            },
+          ),
+          PopupMenuButton<String>(
+            onSelected: _selectVideoFps,
+            icon: const Icon(Icons.menu),
+            itemBuilder: (BuildContext context) {
+              return [
+                PopupMenuItem<String>(
+                  value: _selectedVideoFPS,
+                  child: Text('Select FPS ($_selectedVideoFPS)'),
+                ),
+                const PopupMenuDivider(),
+                ...['8', '15', '30', '60'].map(
+                  (fps) => PopupMenuItem<String>(value: fps, child: Text(fps)),
+                ),
+              ];
+            },
+          ),
+          PopupMenuButton<String>(
+            onSelected: _selectVideoSize,
+            icon: const Icon(Icons.screenshot_monitor),
+            itemBuilder: (BuildContext context) {
+              return [
+                PopupMenuItem<String>(
+                  value: _selectedVideoSize.toString(),
+                  child: Text('Select Video Size ($_selectedVideoSize)'),
+                ),
+                const PopupMenuDivider(),
+                ...['320x180', '640x360', '1280x720', '1920x1080'].map(
+                  (size) =>
+                      PopupMenuItem<String>(value: size, child: Text(size)),
+                ),
+              ];
+            },
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'toggle_video') {
+                _toggleVideoMode();
+              }
+            },
+            icon: const Icon(Icons.videocam),
+            itemBuilder: (BuildContext context) {
+              return [
+                PopupMenuItem<String>(
+                  value: 'toggle_video',
+                  child: Text(
+                    _isVideoEnabled
+                        ? 'Switch to Audio-Only'
+                        : 'Switch to Video',
+                  ),
+                ),
+              ];
+            },
+          ),
         ],
       ),
       body: OrientationBuilder(
@@ -306,7 +543,7 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
                           _inCalling
                               ? (_isVideoEnabled
                                   ? RTCVideoView(_localRenderer)
-                                  : Center(
+                                  : const Center(
                                     child: Icon(
                                       Icons.person,
                                       size: 100,
@@ -323,7 +560,7 @@ class _DeviceEnumerationSampleState extends State<DeviceEnumerationSample> {
                           _inCalling
                               ? (_isVideoEnabled
                                   ? RTCVideoView(_remoteRenderer)
-                                  : Center(
+                                  : const Center(
                                     child: Icon(
                                       Icons.person,
                                       size: 100,
